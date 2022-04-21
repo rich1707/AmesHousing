@@ -1,0 +1,373 @@
+---
+title: 'Ames Housing: Data Cleaning'
+author: "Richard Ryan"
+date: '2022-04-07'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, paged.print = FALSE)
+```
+
+# Introduction
+
+The Ames Housing Dataset is one of the most popular in data-science. There have been thousands of submissions on the [Kaggle website](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques) and it will be interesting to see how our analysis compares. 
+
+There are several ways of accessing the dataset: we have a built-in version in `R` and we also have the files made available on [Kaggle](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data). However, the data we shall use comes instead from [this page](https://www.openintro.org/book/statdata/index.php?data=ames).
+
+The reason for not using the built in `AmesHousing` package is because the data is slightly different from that provided by [Kaggle](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques), making a direct comparison difficult between results problematic. We have not used the [Kaggle data](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data) because it would not be possible to show the results from within this analysis. 
+
+So let's begin our analysis by loading the libraries we shall need. We use the `tidyverse` framework for exploring and manipulating our data, the `janitor` package for cleaning up the names of variables, and the `modeest` package for the `mfv()` function which we shall use frequently in what follows.  
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(modeest)
+```
+
+Our analysis will follow a fairly standard path:
+
+* Read in the data
+* Explore the data
+* Clean the data
+* Engineer new features
+* Build a model and predict on new data
+* Evaluate the results
+
+# Read in our data
+
+The first step is very simple. We use the `read_csv()` function from `readr` to import the file. Using the `clean_names()` function from `janitor` will make the variables much easier to work with. We then split the file into training and test sets, using `set.seed()` to ensure our results can be easily reproduced. 
+
+We make a copy of the `sale_price` variable from the test set, but we delete `sale_price` from the test set itself to avoid any possible data-leakage. 
+
+
+```{r}
+ames_raw <- read_csv("ames.csv") %>% 
+   clean_names()
+```
+
+```{r}
+set.seed(2022)
+```
+
+We now
+```{r}
+ames_splits <- initial_split(ames_raw, prop = 0.7)
+
+ames_train <- training(ames_splits)
+ames_test <- testing(ames_splits)
+```
+
+```{r}
+sale_price <- ames_test %>% 
+   select(sale_price)
+
+ames_test <- ames_test %>% 
+   select(-sale_price)
+```
+
+```{r}
+ames <- bind_rows(ames_train, ames_test)
+```
+
+```{r}
+remove(ames_raw, ames_train, ames_test, ames_splits)
+```
+
+# Exploring our data: missing values
+
+In this section we shall examine our data for any missing values. Fist let's write a simple function, using `map_dfr()` from `purrr` to test for features whose missing values make up more than 50% of the total:
+
+```{r}
+ames %>% 
+   map_dfr(function(.x) tibble(
+      total = length(.x),
+      total_NAs = sum(is.na(.x)),
+      percent_NAs = mean(is.na(.x))),
+      .id = "variable"
+   ) %>% 
+   filter(percent_NAs > 0.5) %>% 
+   arrange(desc(percent_NAs))
+```
+
+These feature are missing so many values that we must drop them from our model. We could easily delete these four values by eye; but doing the job with code is always better:
+
+
+```{r}
+excess_NAs <- ames %>% 
+   summarise(across(everything(), function(.x) mean(is.na(.x)))) %>%
+   select_if(function(.x) .x > 0.5) %>% 
+   names()
+
+excess_NAs
+```
+
+```{r}
+ames <- ames %>% 
+   select(-all_of(excess_NAs))
+
+remove(excess_NAs)
+```
+
+For all other variables we can at least attempt to impute any missing values. Again, let's use `map_dfr()` to see the scale of the problem:
+
+```{r}
+ames %>% 
+   map_dfr(function(.x) tibble(
+      total_NAs = sum(is.na(.x))),
+      .id = "variable") %>% 
+   filter(total_NAs > 0) %>% 
+   arrange(desc(total_NAs)) %>% 
+   print(n = Inf)
+```
+
+We can assume that an `NA` for `fireplace_qu` simply means there is no fireplace. This problem is easily fixed using the `replace_na()` function from `tidyr`:
+
+```{r}
+ames <- ames %>% 
+   mutate(fireplace_qu = replace_na(fireplace_qu, "none"))
+```
+
+The sale price is meant to have missing values, so nothing needs to be done there. Imputing values for the `lot_frontage` feature is more easily done using an algorithm at the `recipe()` stage, so this feature can also be left for the time being.
+
+What about the garage variables? 
+
+## Garage variables
+
+We have to treat these variables as a group, as the way in whcih we fix one will affect how we can approach the others.
+
+For example, We are told in the [data description](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data) on [Kaggle](https://www.kaggle.com/) that an `NA` for `garage_type` mean that the property lacks a garage. Therefore this feature must be addressed first:
+
+```{r}
+ames <- ames %>% 
+   mutate(garage_type = replace_na(garage_type, "none"))
+```
+
+Obviously any other category falling under garage can be replaced accordingly. If there is no garage, then all other `character()` variables relating to garage can be set to `none` also. 
+
+The use of the `across()` function makes this a very straightforward task.
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      where(is.character) & contains("garage"),
+      function(.x) if_else(garage_type == "none", replace_na(.x, "none"), .x)
+   ))
+```
+
+What missing `character()` values remain for the garage variables?
+
+```{r}
+ames %>% 
+   summarise(across(
+      where(is.character) & contains("garage"),
+      function(.x) sum(is.na(.x))
+   )) %>% 
+   select_if(function(.x) .x > 0)
+```
+
+All of the remaining values can be replaced with the mode, for which we use the `mfv()` function from `modeest`:
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      where(is.character) & contains("garage"),
+      function(.x) replace_na(.x, mfv(.x))
+   ))
+```
+
+Now we can consider the numerical properties with a garage:
+
+```{r}
+ames %>% 
+   summarise(across(
+      where(is.numeric) & contains("garage"),
+      function(.x) sum(is.na(.x))
+   ))
+```
+
+For any house without a garage we can substitute zero:
+
+```{r}
+ames <- ames %>% 
+    mutate(across(
+       where(is.numeric) & contains("garage"),
+       function(.x) if_else(garage_type == "none", 0, .x)
+   ))
+```
+
+Do any `NA`s remain for the numerical garage features?
+
+```{r}
+ames %>% 
+   summarise(across(
+      where(is.numeric) & contains("garage"),
+      function(.x) sum(is.na(.x))
+   ))
+```
+
+The `garage_yr_blt` feature can be fixed by imputing the year in which the house was built.
+
+```{r}
+ames <- ames %>% 
+   mutate(garage_yr_blt = if_else(is.na(garage_yr_blt), year_built, garage_yr_blt))
+```
+
+The garage_cars and garage_area features can be replaced with the median of their respective garage_types.
+
+```{r}
+ames <- ames %>% 
+   group_by(garage_type) %>% 
+   mutate(across(
+      where(is.numeric) & contains("garage"),
+      function(.x) replace_na(.x, median(.x, na.rm = TRUE))
+   )) %>% 
+   ungroup()
+```
+
+## Basement Variables
+
+Next we can consider the basement variables. Once again, this group of features contains both numeric and character variable types. We will start with the characters:
+
+```{r}
+ames %>% 
+   summarise(across(
+      contains("bsmt") & where(is.character),
+      function(.x) sum(is.na(.x))
+   ))
+```
+
+We are told that an `NA` for `bsmt_fin_type_1` means there is no basement. Therefore:
+
+```{r}
+ames <- ames %>% 
+   mutate(bsmt_fin_type_1 = replace_na(bsmt_fin_type_1, "none"))
+```
+
+Once again, we can replace all the corresponding basement variables in one go:
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      contains("bsmt") & where(is.character),
+      function(.x) if_else(bsmt_fin_type_1 == "none", "none", .x)
+   ))
+```
+
+The missing values that remain for the `character()` basement features can be replaced by the mode:
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      contains("bsmt") & where(is.character),
+      function(.x) replace_na(.x, mfv(.x))
+   ))
+```
+
+Next we can consider the missing values of `bsmt` variables that are numeric:
+
+```{r}
+ames %>% 
+   summarise(across(
+      where(is.numeric) & contains("bsmt"),
+      function(.x) sum(is.na(.x))
+   ))
+```
+
+The first thing to do is check whether these `NA`s correspond to houses with no basement:
+
+```{r}
+ames %>% 
+   filter(bsmt_fin_type_1 == "none") %>% 
+   select(contains("bsmt") & where(is.numeric)) %>% 
+   filter(is.na(bsmt_fin_sf_1) | is.na(bsmt_fin_sf_2) | is.na(bsmt_unf_sf) | is.na(total_bsmt_sf) | 
+             is.na(bsmt_full_bath) | is.na(bsmt_half_bath)) 
+```
+
+All of the missing values belong to houses without a basement. Therefore this is a one-step fix:
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      contains("bsmt") & where(is.numeric),
+      function(.x) replace_na(.x, 0)
+   ))
+```
+
+## Further Missing Variables
+
+We shall next consider the masonry variables, `mas_vnr_type` and `mas_vnr_area`. As we can see, the `NA` values align here.
+
+```{r}
+ames %>% 
+   select(contains("mas_")) %>% 
+   filter(is.na(mas_vnr_area) | is.na(mas_vnr_type)) %>% 
+   print(n = Inf)
+```
+
+We can, therefore, assume that the `mas_vnr_type` is `none` and that the `mas_vnr_area` is `0`.
+
+```{r}
+ames <- ames %>% 
+   mutate(mas_vnr_type = replace_na(mas_vnr_type, mfv(mas_vnr_type)))
+
+ames <- ames %>% 
+   mutate(mas_vnr_area = replace_na(mas_vnr_area, 0))
+```
+
+The last `NA` value to replace, at least for now, is for the `electrical` feature. Again we can simply impute the mode here:
+
+```{r}
+ames <- ames %>% 
+   mutate(electrical = replace_na(electrical, mfv(electrical)))
+```
+
+As we can see, the only missing values that remain belong to the `sale_price` and the `lot_frontage` features. 
+
+```{r}
+ames %>% 
+   map_dfr(function(.x) tibble(
+      total_NAs = sum(is.na(.x))),
+      .id = "variable") %>% 
+   filter(total_NAs > 0) %>% 
+   arrange(desc(total_NAs)) %>% 
+   print(n = Inf)
+```
+
+This is exactly as it should be. Therefore we can now consider other matters.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

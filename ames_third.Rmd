@@ -1,0 +1,198 @@
+---
+title: 'Ames Housing: Modelling'
+author: "Richard Ryan"
+date: '2022-04-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, paged.print = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(embed)
+library(bestNormalize)
+library(glmnet)
+library(vip)
+```
+
+We are now ready to build our model.
+
+First we need to split into training and test data.
+
+```{r}
+ames_train <- ames %>% 
+   filter(!is.na(sale_price))
+
+ames_test <- ames %>% 
+   filter(is.na(sale_price))
+```
+
+We can now set a seed and make our cross-validation folds:
+
+```{r}
+set.seed(123)
+```
+
+Our model will need tuning, so let's create data for cross-validation.
+
+```{r}
+ames_k_folds <- vfold_cv(ames_train, v = 10, repeats = 10)
+```
+
+In the `tidymodels` ecosystem, the preprocessing is done via a `recipe`, which is a series of steps that transforms our data before passing it to the model engine.
+
+```{r}
+ames_recipe <- 
+   ames_train %>% 
+   recipe(sale_price ~ .) %>% 
+   step_rm(order, pid) %>% 
+   step_log(sale_price, skip = TRUE) %>% 
+   step_lencode_mixed(ms_sub_class, outcome = vars(sale_price)) %>% 
+   step_lencode_mixed(neighborhood, outcome = vars(sale_price)) %>% 
+   step_lencode_mixed(exterior_1st, outcome = vars(sale_price)) %>% 
+   step_lencode_mixed(exterior_2nd, outcome = vars(sale_price)) %>% 
+   step_ordinalscore(all_of(!!ordinal_factors)) %>% 
+   step_other(all_of(!!nominal_factors), threshold = 0.05) %>% 
+   step_dummy(all_of(!!nominal_factors), one_hot = TRUE) %>% 
+   step_impute_knn(lot_frontage) %>% 
+   step_YeoJohnson(all_numeric_predictors()) %>% 
+   step_nzv(all_predictors()) %>% 
+   step_corr(all_predictors()) %>% 
+   step_normalize(all_numeric_predictors())
+```
+
+We shall use linear regression to predict the outcomes. More specifically we shall use an elastic net model where the values for `penalty` and `mixture` are found via extensive tuning. 
+
+```{r}
+elastic_spec <- linear_reg(
+   penalty = tune(),
+   mixture = tune()
+) %>% 
+   set_mode("regression") %>% 
+   set_engine("glmnet")
+```
+
+We wrap our `recipe` and `model_spec` into a `workflow`. This isn't necessary but it make the process much simpler. 
+
+```{r}
+ames_workflow <- workflow() %>% 
+   add_model(elastic_spec) %>% 
+   add_recipe(ames_recipe)
+```
+
+Tuning a model can be very time consuming, so we utilise as many cores as possible.
+
+```{r}
+doParallel::registerDoParallel()
+```
+
+We now set a seed so our results are easily reproduced:
+
+```{r}
+set.seed(2022)
+```
+
+Finally we tune the hyper-parameters of our model:
+
+```{r}
+elastic_net_tune <- tune_grid(
+   ames_workflow,
+   resamples = ames_k_folds,
+   grid = 30
+)
+```
+
+We can use the `select_best` function to find the best combination of hyper-parameters: 
+
+```{r}
+elastic_net_rmse <-  elastic_net_tune %>% 
+   select_best("rmse", maximize = FALSE)
+```
+
+The last thing to do before fitting our model is to update our workflow with the `elastic_net_rmse` above. We do this using the `finalize_workflow()` function:
+
+```{r}
+final_workflow <- 
+   finalize_workflow(ames_workflow, elastic_net_rmse)
+```
+
+Finally we can fit our model.
+
+```{r}
+ames_model <- final_workflow %>% 
+   fit(data = ames_train)
+```
+
+The `vip` package allows us a very simple way of visualising the most important features.
+
+```{r}
+ames_model %>% 
+   extract_fit_engine() %>% 
+   vip(geom = "col")
+```
+The test of any model is how well it performs on unseen data. So let's `predict()` on our test data an see how the results hold up.
+
+```{r}
+ames_preds <- ames_model %>% 
+   predict(new_data = ames_test)
+```
+
+The competition on [Kaggle is evaluated using the RMSE between the predicted value and the sale price]("https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/overview/evaluation")
+
+Therefore we bind our predictions with the `sale_price` dataframe, converting the `sale_price` variable to the logarithmic scale. We then use the `rmse()` function form `yardstick` to give us our result. 
+
+```{r}
+ames_preds <- ames_preds %>% 
+   bind_cols(sale_price) %>% 
+   mutate(sale_price = log(sale_price))
+
+ames_preds %>% rmse(.pred, sale_price)
+```
+
+The [Kaggle leaderboard]("https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/leaderboard") suggests that anything less than 0.13 is a fairly good performance, but no doubt our result could be improved upon. For example, IN OUR `recipe()` we could use `step_poly()` or `step_ns()` to capture any non-linearity. We could also investigate any possible interactions between terms using `step_interact()`.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

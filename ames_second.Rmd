@@ -1,0 +1,464 @@
+---
+title: 'Ames Housing: Data Cleaning'
+author: "Richard Ryan"
+date: '2022-04-07'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, paged.print = FALSE)
+```
+
+# Further data cleaning
+
+Now we have imputed all of the missing values we need, we are free to turn our attention to other ways in which our data might be faulty.
+
+We shall consider the following potential problems:
+
+* Date features
+* Possible factor variables
+* Continuous variable and the problem of zero-inflation
+* Outliers
+* Non-normal distributions
+
+As always, we start by loading the packages we shall need. 
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(moments)
+library(bestNormalize)
+```
+
+## Date variables
+
+All dates in our dataset are cast as numeric features. This is how we want them in our final model, but they will not be useful in their present format, as we are less interested in the age of the house or garage than we are in the age of the house or garage at the time of sale. Therefore we shall calculate the difference between the date a feature was built and the date on which it was sold.
+
+```{r}
+date_variables <- c("year_built", "year_remod_add", "mo_sold", "yr_sold", "garage_yr_blt")
+```
+
+Before we convert these features, we should perhaps consider whether there are any values that need addressing. Data entry errors can often leave us with values that are implausible or even impossible.
+
+```{r}
+ames %>% 
+   select(all_of(date_variables)) %>% 
+   map_df(function(.x) tibble(zero_count = sum(.x == 0, na.rm = TRUE),
+                              min = min(.x, na.rm = TRUE),
+                              median = median(.x, na.rm = TRUE),
+                              max = max(.x, na.rm = TRUE)),
+          .id = "variable") %>% 
+   select(variable, zero_count, min, median, max) %>% 
+   arrange(desc(max))
+```
+
+The basic idea has been to convert these features to age at the time of sale. The problem is both `garage_yr_blt` and `year_remod_add` are both zero-inflated, which makes it difficult to engineer any age related features - I am taking the date of 1950 to indicate a zero in the case of `year_remod_add`. It is perhaps excessive, but I will drop both variables.
+
+```{r}
+ames <- ames %>% 
+   mutate(house_age = yr_sold - year_built) %>% 
+   select(-all_of(date_variables))
+```
+
+So now date-time features are just additional continuous variables. We will return to them later when we consider whether our numerical values can be made to fit into a normal distribution. 
+
+## Factor variables
+
+Next we address numeric features that are factors in disguise. The `ms_sub_class` is clearly not a numeric variable. Likewise the `overall_qual` and `overall_cond` are better represented as factors. For the time being we shall convert them to `character()` variables before converting them to factors (nominal and ordinal respectively) at the `recipe` stage. 
+
+```{r}
+ames <- ames %>% 
+   mutate(across(c(ms_sub_class, overall_qual, overall_cond),
+          function(.x) as.character(.x)))
+```
+
+## Continuous variables
+
+We can now turn our attention to the numeric values proper. In this dataset, the numeric features can be split into two types: (1) those which represent continuous features;  and (2) those which represent discrete features. The chief problem here, for both types of numeric feature, is the presence of too many zero values. 
+
+Our goal is to address the problem of zero-inflation, so our analysis can be confined to continuous features. Discrete or count variables don't suffer from zero-inflation but rather from zero (or near-zero) variance. This is a problem we can address at the recipe stage.
+
+```{r}
+continuous_variables <- 
+   c("lot_area", "mas_vnr_area", "bsmt_fin_sf_1", "bsmt_fin_sf_2", "bsmt_unf_sf", 
+     "total_bsmt_sf", "x1st_flr_sf", "x2nd_flr_sf", "low_qual_fin_sf", "gr_liv_area",
+      "garage_area", "wood_deck_sf", "open_porch_sf", "enclosed_porch", "x3ssn_porch",
+      "screen_porch", "pool_area", "misc_val", "house_age")
+```
+
+```{r}
+ames %>% 
+   select(all_of(continuous_variables)) %>% 
+   map_dfr(function(.x) tibble(zero_count = sum(.x == 0),
+                              percent_zero = round(zero_count / length(.x), 3)),
+          .id = "variable") %>% 
+   filter(zero_count > 0) %>% 
+   arrange(desc(zero_count))
+
+remove(continuous_variables)
+```
+
+Any features that have a very high degree of zero values should be deleted, unless the variable in question can be combined with one of more other features to reduce the number of zeros to an acceptable level.
+
+For example, we can combine any outside living areas as follows:
+
+```{r}
+ames <- ames %>% 
+   mutate(porch_x_deck = x3ssn_porch + screen_porch + enclosed_porch + 
+             wood_deck_sf + open_porch_sf) %>% 
+   select(-x3ssn_porch, -screen_porch, -enclosed_porch, -wood_deck_sf, -open_porch_sf)
+```
+
+Next we can combine bathrooms:
+
+```{r}
+ames <- ames %>% 
+   mutate(total_bathrooms = full_bath + bsmt_full_bath + (half_bath * 0.5) + (bsmt_half_bath * 0.5)) %>% 
+   select(-full_bath, -bsmt_full_bath, -half_bath, -bsmt_half_bath)
+```
+
+Next we can create a variable for total square foot above ground (this replaces `gr_liv_area` with a more accurate figure):
+
+```{r}
+ames <- ames %>% 
+   mutate(sqft_above_ground = x1st_flr_sf + x2nd_flr_sf) %>% 
+   select(-x1st_flr_sf, -x2nd_flr_sf, -gr_liv_area)
+```
+
+As we already have a value for `total_bsmt_sf`, we can eliminate any further basement variables:
+
+```{r}
+ames <- ames %>% 
+   select(-bsmt_fin_sf_1, -bsmt_fin_sf_2, -bsmt_unf_sf)
+```
+
+Any remaining values with more than 50% of the values == zero can be dropped. Once again, we shall do this by code rather than by eye:
+
+```{r}
+excess_zeros <-ames %>% 
+   summarise(across(everything(), function(.x) mean(.x == 0, na.rm = TRUE))) %>% 
+   select_if(function(.x) .x > 0.5) %>% 
+   names()
+
+ames <- ames %>% 
+   select(-all_of(excess_zeros))
+
+remove(excess_zeros)
+```
+
+We are now left with the following continuous variables:
+
+```{r}
+continuous_variables <- c("lot_area", "total_bsmt_sf", "garage_area", "house_age",
+                          "porch_x_deck", "sqft_above_ground")
+```
+
+## Outliers
+
+We can now look at outliers. The standard method of calculating outliers is to define any value as an outlier if it meets either of the following conditions: (1) it is less than Q1 - 1.5 * IQR; or (2) it is more than Q3 + 1.5 * IQR. 
+
+Let's construct a table showing all outliers before investigating in closer detail:
+
+```{r}
+ames %>% 
+   select(all_of(continuous_variables)) %>% 
+   map_dfr(function(.x) tibble(zero_count = sum(.x == 0),
+                               min = min(.x),
+                               first = quantile(.x, 0.25),
+                               median = median(.x),
+                               third = quantile(.x, 0.75),
+                               max = max(.x),
+                               low_outliers = sum(.x < (first - (1.5 * third - first))),
+                               high_outliers = sum(.x > (third + (1.5 * (third - first))))),
+           .id = "variable") %>% 
+   select(variable, low_outliers, high_outliers, min, median, max) %>% 
+   arrange(desc(high_outliers)) %>% 
+   print(n = Inf)
+```
+
+It is interesting that we have a house that was sold before it was actually built. As this is perfectly possible, and as all the other values of this variable seem reasonable, we shall not perform any additional feature engineering on this feature.
+
+With the exception of `house_age`, all of the `max()` values in the above table seem very suspect. 
+
+Let's create an upper bound for the value of `lot_area`:
+
+```{r}
+lot_upper <- ames %>% 
+   summarise(
+      upper_bound_lot = quantile(lot_area, 0.75) + 1.5 * IQR(lot_area)
+   ) %>% 
+   as.double()
+
+lot_upper
+```
+
+We now substitute `lot_upper` for any outliers in `lot_area`:
+
+```{r}
+ames <- ames %>% 
+   mutate(lot_area = if_else(
+      lot_area > lot_upper,
+      lot_upper,
+      lot_area
+   ))
+```
+
+We repeat this process for all other outliers:
+
+```{r}
+sqft_upper <- ames %>% 
+   summarise(
+      sqft_upper = quantile(sqft_above_ground, 0.75) + 1.5 * IQR(sqft_above_ground)
+   ) %>% 
+   as.double()
+
+porch_upper <- ames %>% 
+   summarise(
+      porch_upper = quantile(porch_x_deck, 0.75) + 1.5 * IQR(porch_x_deck)
+   ) %>% 
+   as.double()
+
+bsmt_upper <- ames %>% 
+   summarise(
+      bsmt_upper = quantile(total_bsmt_sf, 0.75) + 1.5 * IQR(total_bsmt_sf)
+   ) %>% 
+   as.double()
+
+garage_upper <- ames %>% 
+   summarise(
+      garage_upper = quantile(garage_area, 0.75) + 1.5 * IQR(garage_area)
+   ) %>% 
+   as.double()
+```
+
+When then trim the relevant values in our dataframe:
+
+```{r}
+ames <- ames %>% 
+   mutate(sqft_above_ground = if_else(
+      sqft_above_ground > sqft_upper,
+      sqft_upper,
+      sqft_above_ground
+   ))
+
+ames <- ames %>% 
+   mutate(porch_x_deck = if_else(
+      porch_x_deck > porch_upper,
+      porch_upper,
+      porch_x_deck
+   ))
+
+ames <- ames %>% 
+   mutate(total_bsmt_sf = if_else(
+      total_bsmt_sf > bsmt_upper,
+      bsmt_upper,
+      total_bsmt_sf
+   ))
+
+ames <- ames %>% 
+   mutate(garage_area = if_else(
+      garage_area > garage_upper,
+      garage_upper,
+      garage_area
+   ))
+```
+
+## Is the distribution normal?
+
+when building a linear model we want all of our variables to be normally distributed. Let's first look at our response variable `sale_price`:
+
+```{r warning = FALSE}
+ames %>% 
+   ggplot(aes(x = sale_price)) +
+   geom_histogram(colour = "black", bins = 30)
+```
+We can easily log-transform this value:
+
+```{r warning = FALSE}
+ames %>% 
+   ggplot(aes(x = log(sale_price))) +
+   geom_histogram(colour = "black", bins = 30)
+```
+This seems a better, more normal distribution. However, it may be that other transformations, such as `sqrt()` work even better, though we are limited to fairly basic transformations in the case of the response variable as they have to be transformed back to the original scale once we have built our model.  
+
+It would be tedious to create plots for all possible transformations for each of the explanatory variables in which we are interested. Instead let's use `map_dfr()` to create a table showing the levels of skew for each value. 
+
+```{r warning=FALSE}
+ames %>% 
+   select(all_of(continuous_variables), lot_frontage, sale_price) %>% 
+   map_dfr(function(.x) tibble(skew_base = round(skewness(.x, na.rm = TRUE), 3),
+                               skew_log = round(skewness(log(.x), na.rm = TRUE), 3),
+                               skew_sqrt = round(skewness(sqrt(.x), na.rm = TRUE), 3),
+                               skew_yeo = round(skewness(predict(yeojohnson(.x)), na.rm = TRUE), 3), 
+                               skew_bn = round(skewness(predict(bestNormalize(.x)), na.rm = TRUE), 3)),
+          .id = "variable") %>% 
+   mutate(across(is.numeric, abs))
+```
+
+All of our explanatory variables are best transformed using either `step_YeoJohnson()` or `step_orderNorm()`. We can order these into vectors to make our task easier at the `recipe` stage. As we are imputing `lot_frontage` we do not include it at this stage.
+
+```{r}
+transform_yeo <- c("lot_area", "sqft_above_ground")
+
+transform_ord <- c("total_bsmt_sf", "garage_area", "house_age", "porch_x_deck")
+```
+
+## Factors: Ordinal and Nominal
+
+At this point, all of our factor variables are still represented as strings. We can change these values to factors in our recipe, but we shall first need to identify the features in question. The problem is made much more difficult by the presence of both nominal and ordinal variables. The ordinal variables are also problematic as they do not usually share levels, so several sub-categories will have to be contructed. 
+
+Let's start with a table showing all of the categorical features:
+
+
+```{r}
+ames %>% 
+   select(where(is.character)) %>%
+   map_dfr(function(.x) tibble(
+      type = type_sum(.x),
+      total = n_distinct(.x)
+   ), .id = "variable") %>% 
+   arrange(-total) %>% 
+   print(n = Inf)
+```
+
+We can consider any feature with more than ten values to be high-dimensional. We can create a vector of these variables and use the `embed` package to reduce their dimensionality in our `recipe`.  
+
+```{r}
+ames %>% 
+   summarise(across(where(is.character), n_distinct)) %>% 
+   select_if(function(.x) .x > 10) %>% 
+   colnames() 
+```
+
+The following vector represents the remaining nominal factors.
+
+```{r}
+nominal_factors <- 
+   c("ms_zoning", "street", "lot_shape", "utilities", "lot_config",
+     "condition_1", "condition_2", "bldg_type", "house_style", "roof_style","roof_matl",
+     "mas_vnr_type", "foundation", "heating", "central_air", "electrical", 
+     "garage_type", "paved_drive", "sale_type", "sale_condition", "land_contour", "land_slope")
+```
+
+Now we come to the ordinal factors. Here we will need both a vector of features and a vector showing the order.
+
+```{r}
+overall_factors <- c("overall_qual", "overall_cond")
+
+overall_levels <- c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10")
+```
+
+```{r}
+qual_x_cond_factors <- c("exter_qual", "exter_cond","bsmt_qual", "bsmt_cond", 
+                         "heating_qc", "kitchen_qual", "fireplace_qu", "garage_qual", 
+                         "garage_cond")
+
+qual_x_cond_levels <- c("none", "Po", "Fa", "TA", "Gd", "Ex")
+```
+
+```{r}
+bsmt_factors <- c("bsmt_fin_type_1", "bsmt_fin_type_2")
+
+bsmt_levels <- c("none", "Unf", "LwQ", "Rec", "BLQ", "ALQ", "GLQ")
+```
+
+There are also three stand-alone ordinal factors, namely `bsmt_exposure`, `functional` and `garage_finish`, for which we need to supply vectors for the appropriate levels:
+
+```{r}
+bsmt_exposure_levels <- c("none", "No", "Mn", "Av", "Gd")
+
+functional_levels <- c("Sal", "Sev", "Maj2", "Maj1", "Mod", "Min2", "Min1", "Typ")
+
+garage_finish_levels <- c("none", "Unf", "RFn", "Fin")
+```
+
+We are now in a position to start building our model. (Feature engineering ahead of recipe)
+
+```{r}
+ames <- ames %>% 
+   mutate(across(all_of(nominal_factors), as.factor)) 
+```
+
+```{r}
+ordinal_factors <- c("overall_qual", "overall_cond", "exter_qual", "exter_cond",
+                     "bsmt_qual", "bsmt_cond", "bsmt_exposure", "bsmt_fin_type_1", 
+                     "bsmt_fin_type_2", "heating_qc","kitchen_qual", "functional", 
+                     "fireplace_qu", "garage_finish", "garage_qual", "garage_cond")
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(overall_qual = factor(
+      overall_qual, 
+      levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"),
+      ordered = TRUE
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(overall_cond = factor(
+      overall_cond,
+      levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9"),
+      ordered = TRUE
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(exter_qual = factor(
+      exter_qual,
+      levels = c("Fa", "TA", "Gd", "Ex"),
+      ordered = TRUE
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      c(exter_qual, exter_cond, heating_qc, kitchen_qual),
+      ~factor(.x, levels = c("Po", "Fa", "TA", "Gd", "Ex"), ordered = TRUE)
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      c(bsmt_qual, bsmt_cond, fireplace_qu, garage_qual, garage_cond), 
+      ~factor(.x, levels = c("none", "Po", "Fa", "TA", "Gd", "Ex"), ordered = TRUE)
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(bsmt_exposure = factor(
+      bsmt_exposure, levels = c("none", "No", "Mn", "Av", "Gd"), ordered = TRUE)
+   )
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(across(
+      c(bsmt_fin_type_1, bsmt_fin_type_2),
+      ~factor(.x, levels = c("none", "Unf", "LwQ", "Rec", "BLQ", "ALQ", "GLQ"), ordered = TRUE)
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(functional = factor(
+      functional, 
+      levels = c("Sal", "Sev", "Maj2", "Maj1", "Mod", "Min2", "Min1", "Typ"),
+      ordered = TRUE
+   ))
+```
+
+```{r}
+ames <- ames %>% 
+   mutate(garage_finish = factor(
+      garage_finish,
+      levels = c("none", "Unf", "RFn", "Fin"),
+      ordered = TRUE
+   ))
+```
+
