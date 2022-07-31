@@ -1,0 +1,1201 @@
+---
+title: "Ames Housing Model"
+author: "Richard Ryan"
+date: '23 April 2022'
+output: 
+   html_document:
+      css: style.css
+      theme: readable
+      highlight: pygments
+      toc: true
+      toc_depth: 3
+      toc_float: true
+      number_sections: true
+--- 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+   echo = TRUE, 
+   message = FALSE, 
+   warning = FALSE, 
+   paged.print = FALSE
+)
+```
+
+
+<body style="background-color:#ede8df;">
+
+# Introduction
+
+The Ames Housing Dataset is one of the most popular in data-science. There have been thousands of submissions on the [Kaggle website](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques) and it will be interesting to see how our analysis compares. 
+
+There are several ways of accessing the dataset: we have a built-in version in `R` and we also have the [files](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data) made available on Kaggle. However, the data we shall use comes instead from [this page](https://www.openintro.org/book/statdata/index.php?data=ames).
+
+The reason for not using the built in `AmesHousing` package is because the data is slightly different from that provided by Kaggle, making a direct comparison between results problematic. We have not used the [Kaggle data](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data) because that data needs to be submitted to Kaggle to obtain a score. Therefore it would not be possible to show the results of our model from within this analysis. 
+
+Let's first load the packages we need:
+
+```{r}
+
+library(tidyverse)
+library(janitor)
+library(scales)
+
+library(bestNormalize)
+library(modeest)
+library(moments)
+
+library(tidymodels)
+library(embed)
+library(glmnet)
+
+library(vip)
+
+```
+
+Our analysis will follow a fairly standard path:
+
+* Read in the data
+* Explore the data
+* Clean the data
+* Engineer new features
+* Build a model and predict on new data
+* Evaluate the results
+
+# Read in the data
+
+The first step is very simple. We use the `read_csv()` function from `readr` to import the file. Using the `clean_names()` function from `janitor` will make the variables much easier to work with. We then split the file into training and test sets, using `set.seed()` to ensure our results can be easily reproduced. 
+
+We make a copy of the `sale_price` variable from the test set, but we delete `sale_price` from the test set itself to avoid any possible data-leakage. 
+
+```{r}
+
+ames_raw <- read_csv("ames.csv") %>% 
+   clean_names()
+
+```
+
+We set a seed to ensure that the exact split can be reproduced:
+
+```{r}
+
+set.seed(2022)
+
+```
+
+We now split the data into training and test sets. 
+
+```{r}
+
+ames_splits <- initial_split(ames_raw, prop = 0.7)
+
+ames_train <- training(ames_splits)
+ames_test <- testing(ames_splits)
+
+```
+
+As we shall see, our data will need extensive cleaning before it can be used in a model. This is much simpler to do for a single data-set, but runs the risk of data-leakage. We can get round this problem as follows: (1) create a dataframe whose only column is the sale price variable from the test-set; and (2) remove the sale price from the test set.
+
+```{r}
+
+sale_price <- ames_test %>% 
+   select(sale_price)
+
+ames_test <- ames_test %>% 
+   select(-sale_price)
+
+```
+
+We can now safely bind our train and test sets together:
+
+```{r}
+
+ames <- bind_rows(ames_train, ames_test)
+
+```
+
+The training and test sets can now be removed. We will clean our data and then split it again when we are ready to begin the modelling process.
+
+```{r}
+
+remove(ames_raw, ames_train, ames_test, ames_splits)
+
+```
+
+# Data Cleaning
+
+In this section we shall examine our data for any missing values. Fist let's write a simple function, using `map_dfr()` from `purrr` to test for features whose missing values make up more than 50% of the total:
+
+```{r}
+
+ames %>% 
+   map_dfr(function(.x) tibble(
+      total = length(.x),
+      total_NAs = sum(is.na(.x)),
+      percent_NAs = mean(is.na(.x))),
+      .id = "variable"
+   ) %>% 
+   filter(percent_NAs > 0.5) %>% 
+   arrange(desc(percent_NAs))
+
+```
+
+These feature are missing so many values that we must drop them from our model. We could easily delete these four values by eye; but doing the job with code is always better.
+
+We first create a vector of the feature names to be removed:
+
+```{r}
+
+excess_NAs <- ames %>% 
+   summarise(across(everything(), function(.x) mean(is.na(.x)))) %>%
+   select_if(function(.x) .x > 0.5) %>% 
+   names()
+
+excess_NAs
+
+```
+
+Then we remove the values in question:
+
+```{r}
+
+ames <- ames %>% 
+   select(-all_of(excess_NAs))
+
+remove(excess_NAs)
+
+```
+
+For all other variables we can at least attempt to impute any missing values. Let's once again use `map_dfr()` to see the scale of the problem:
+
+```{r}
+
+ames %>% 
+   map_dfr(function(.x) tibble(
+      total_NAs = sum(is.na(.x))),
+      .id = "variable") %>% 
+   filter(total_NAs > 0) %>% 
+   arrange(desc(total_NAs)) %>% 
+   print(n = Inf)
+
+```
+
+We can assume that an `NA` for `fireplace_qu` simply means there is no fireplace. This problem is easily fixed using the `replace_na()` function from `tidyr`:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(fireplace_qu = replace_na(fireplace_qu, "none"))
+
+```
+
+The sale price is meant to have missing values, so nothing needs to be done there. Imputing values for the `lot_frontage` feature is more easily done using an algorithm at the `recipe()` stage, so this feature can also be left as is for the time being.
+
+What about the garage variables? 
+
+## Garage variables
+
+We have to treat these variables as a group, as the way in which we fix one will affect how we can approach the others.
+
+For example, We are told in the [data description](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/data) on [Kaggle](https://www.kaggle.com/) that an `NA` for `garage_type` mean that the property lacks a garage. Therefore this feature must be addressed first:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(garage_type = replace_na(garage_type, "none"))
+
+```
+
+Obviously any other category falling under garage can be replaced accordingly. If there is no garage, then all other `character()` variables relating to garage can be set to `none` also. 
+
+The use of the `across()` function makes this a very straightforward task.
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      where(is.character) & contains("garage"),
+      function(.x) if_else(garage_type == "none", replace_na(.x, "none"), .x)
+   ))
+
+```
+
+What missing `character()` values remain for the garage variables?
+
+```{r}
+
+ames %>% 
+   summarise(across(
+      where(is.character) & contains("garage"),
+      function(.x) sum(is.na(.x))
+   )) %>% 
+   select_if(function(.x) .x > 0)
+
+```
+
+All of the remaining values can be replaced with the mode, for which we use the `mfv()` function from `modeest`:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      where(is.character) & contains("garage"),
+      function(.x) replace_na(.x, mfv(.x))
+   ))
+
+```
+
+Now we can consider the numerical properties relating to the garage feature:
+
+```{r}
+
+ames %>% 
+   summarise(across(
+      where(is.numeric) & contains("garage"),
+      function(.x) sum(is.na(.x))
+   ))
+
+```
+
+For any house without a garage we can substitute zero:
+
+```{r}
+
+ames <- ames %>% 
+    mutate(across(
+       where(is.numeric) & contains("garage"),
+       function(.x) if_else(garage_type == "none", 0, .x)
+   ))
+
+```
+
+Do any `NA`s remain for the numerical garage features?
+
+```{r}
+
+ames %>% 
+   summarise(across(
+      where(is.numeric) & contains("garage"),
+      function(.x) sum(is.na(.x))
+   ))
+
+```
+
+The `garage_yr_blt` feature can be fixed by imputing the year in which the house was built.
+
+```{r}
+
+ames <- ames %>% 
+   mutate(garage_yr_blt = if_else(is.na(garage_yr_blt), year_built, garage_yr_blt))
+
+```
+
+The garage_cars and garage_area features can be replaced with the median of their respective garage_types.
+
+```{r}
+
+ames <- ames %>% 
+   group_by(garage_type) %>% 
+   mutate(across(
+      where(is.numeric) & contains("garage"),
+      function(.x) replace_na(.x, median(.x, na.rm = TRUE))
+   )) %>% 
+   ungroup()
+
+```
+
+## Basement Variables
+
+Next we can consider the basement variables. Once again, this group of features contains both numeric and character variable types. We will start with the characters:
+
+```{r}
+
+ames %>% 
+   summarise(across(
+      contains("bsmt") & where(is.character),
+      function(.x) sum(is.na(.x))
+   ))
+
+```
+
+We are told that an `NA` for `bsmt_fin_type_1` means there is no basement. Therefore:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(bsmt_fin_type_1 = replace_na(bsmt_fin_type_1, "none"))
+
+```
+
+Once again, we can replace all the corresponding basement variables in one go:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      contains("bsmt") & where(is.character),
+      function(.x) if_else(bsmt_fin_type_1 == "none", "none", .x)
+   ))
+
+```
+
+The missing values that remain for the `character()` basement features can be replaced by the mode:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      contains("bsmt") & where(is.character),
+      function(.x) replace_na(.x, mfv(.x))
+   ))
+
+```
+
+Next we can consider the missing values of `bsmt` variables that are numeric:
+
+```{r}
+
+ames %>% 
+   summarise(across(
+      where(is.numeric) & contains("bsmt"),
+      function(.x) sum(is.na(.x))
+   ))
+
+```
+
+The first thing to do is check whether these `NA`s correspond to houses with no basement:
+
+```{r}
+
+ames %>% 
+   filter(bsmt_fin_type_1 == "none") %>% 
+   select(contains("bsmt") & where(is.numeric)) %>% 
+   filter(is.na(bsmt_fin_sf_1) | is.na(bsmt_fin_sf_2) | is.na(bsmt_unf_sf) | 
+             is.na(total_bsmt_sf) | is.na(bsmt_full_bath) | is.na(bsmt_half_bath)) 
+
+```
+
+All of the missing values belong to houses without a basement. Therefore this is a one-step fix:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      contains("bsmt") & where(is.numeric),
+      function(.x) replace_na(.x, 0)
+   ))
+
+```
+
+## Further Missing Variables
+
+We shall next consider the masonry variables, `mas_vnr_type` and `mas_vnr_area`. As we can see, the `NA` values align here.
+
+```{r}
+
+identical(is.na(ames$mas_vnr_type), is.na(ames$mas_vnr_area))
+
+```
+
+We can, therefore, assume that the `mas_vnr_type` is `none` and that the `mas_vnr_area` is `0`.
+
+```{r}
+
+ames <- ames %>% 
+   mutate(mas_vnr_type = replace_na(mas_vnr_type, mfv(mas_vnr_type)))
+
+ames <- ames %>% 
+   mutate(mas_vnr_area = replace_na(mas_vnr_area, 0))
+
+```
+
+The last `NA` value to replace, at least for now, is for the `electrical` feature. Again we can simply impute the mode here:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(electrical = replace_na(electrical, mfv(electrical)))
+
+```
+
+As we can see, the only missing values that remain belong to the `sale_price` and the `lot_frontage` features. 
+
+```{r}
+
+ames %>% 
+   map_dfr(function(.x) tibble(
+      total_NAs = sum(is.na(.x))),
+      .id = "variable") %>% 
+   filter(total_NAs > 0) %>% 
+   arrange(desc(total_NAs))
+
+```
+
+This is exactly as it should be. Therefore we can now move on to Feature Engineering.
+
+# Feature Engineering
+
+For the most part, our feature engineering won't be anything too radical. We shall instead focus on simple methods of preparing our date variables, our factor variables, and our continuous variables. 
+
+## Date variables
+
+All dates in our dataset are cast as numeric features. This is how we want them in our final model, but they will not be useful in their present format, as we are less interested in the age of the house or garage than we are in the age of the house or garage at the time of sale. Therefore we shall calculate the difference between the date a feature was built and the date on which it was sold.
+
+```{r}
+
+date_variables <- c("year_built", "year_remod_add", "mo_sold", "yr_sold", "garage_yr_blt")
+
+```
+
+Before we convert these features, we should perhaps consider whether there are any values that need addressing. Data entry errors can often leave us with values that are implausible or even impossible.
+
+```{r}
+
+ames %>% 
+   select(all_of(date_variables)) %>% 
+   map_dfr(function(.x) tibble(
+      zero_count = sum(.x == 0, na.rm = TRUE),
+      min = min(.x, na.rm = TRUE),
+      median = median(.x, na.rm = TRUE),
+      max = max(.x, na.rm = TRUE)
+   ),
+      .id = "variable") %>% 
+   select(variable, zero_count, min, median, max) %>% 
+   arrange(desc(max))
+
+```
+
+The basic idea is to engineer an age at-the-time-of-sale variable. The problem is that both `garage_yr_blt` and `year_remod_add` are both zero-inflated, which makes it difficult to engineer any age related features - I am taking the date of 1950 to indicate a zero in the case of `year_remod_add`. It is perhaps excessive, but I will drop both variables from our model.
+
+The only variable we shall use is `house_age` which is simply the `yr_sold` - `year_built`:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(house_age = yr_sold - year_built) %>% 
+   select(-all_of(date_variables))
+
+remove(date_variables)
+
+```
+
+So now our date-time features are transformed into continuous variables. We will return to them later when we consider whether our numerical values can be made to fit into a normal distribution. 
+
+## Factor variables
+
+Next we address numeric features that are factors in disguise. The `ms_sub_class` is clearly not a numeric variable. Likewise the `overall_qual` and `overall_cond` are better represented as factors. For the time being we shall convert them to `character()` variables before converting them to factors of the appropriate sort (either nominal or ordinal). 
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(c(ms_sub_class, overall_qual, overall_cond),
+          function(.x) as.character(.x)))
+
+```
+
+## High Dimensional Factors
+
+Factors with too many levels tend to cause problems. Let's identify any factors with more than 10 levels:
+
+```{r}
+
+high_dims <- ames %>% 
+   select(where(is.character)) %>% 
+   summarise(across(everything(), function(.x) n_distinct(.x))) %>% 
+   select_if(function(.x) .x > 10) %>% 
+   colnames()
+
+high_dims
+
+```
+
+We can address these variables using the `embed` package in our `recipe`. 
+
+## Nominal factors
+
+Our task here is simple. Construct a vector of noial variables and then convert all of them to a factor in a single go. Here is the vector:
+
+```{r}
+
+nominal_factors <- 
+   c("ms_zoning", "street", "lot_shape", "utilities", "lot_config",
+     "condition_1", "condition_2", "bldg_type", "house_style", "roof_style","roof_matl",
+     "mas_vnr_type", "foundation", "heating", "central_air", "electrical", 
+     "garage_type", "paved_drive", "sale_type", "sale_condition", "land_contour", "land_slope")
+
+```
+
+We now convert the above features to nominal factors:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(all_of(nominal_factors), as.factor)) 
+
+```
+
+We now turn our attention to ordinal factors. This is a much more laborious problem as the levels of the factors differ from one feature to another.
+
+## Ordinal Factors
+
+Once again, we start by constructing a vector of the ordinal factors. We won't need this right now, but it will be useful in our `recipe`.
+
+```{r}
+
+ordinal_factors <- c("overall_qual", "overall_cond", "exter_qual", "exter_cond",
+                     "bsmt_qual", "bsmt_cond", "bsmt_exposure", "bsmt_fin_type_1", 
+                     "bsmt_fin_type_2", "heating_qc","kitchen_qual", "functional", 
+                     "fireplace_qu", "garage_finish", "garage_qual", "garage_cond")
+
+```
+
+Unfortunately we have no choice but to address many of these factors separately, as many of the variables have a unique vector of levels. 
+
+Some, however, can be done together:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      c(exter_qual, exter_cond, heating_qc, kitchen_qual),
+      ~factor(.x, levels = c("Po", "Fa", "TA", "Gd", "Ex"), ordered = TRUE)
+   ))
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      c(bsmt_qual, bsmt_cond, fireplace_qu, garage_qual, garage_cond), 
+      ~factor(.x, levels = c("none", "Po", "Fa", "TA", "Gd", "Ex"), ordered = TRUE)
+   ))
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      c(bsmt_fin_type_1, bsmt_fin_type_2),
+      ~factor(.x, levels = c("none", "Unf", "LwQ", "Rec", "BLQ", "ALQ", "GLQ"), ordered = TRUE)
+   ))
+
+```
+
+The rest of these features have to be done one at a time:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(overall_cond = factor(
+      overall_cond,
+      levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9"),
+      ordered = TRUE
+   ))
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(overall_qual = factor(
+      overall_qual, 
+      levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"),
+      ordered = TRUE
+   ))
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(exter_qual = factor(
+      exter_qual,
+      levels = c("Fa", "TA", "Gd", "Ex"),
+      ordered = TRUE
+   ))
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(bsmt_exposure = factor(
+      bsmt_exposure, levels = c("none", "No", "Mn", "Av", "Gd"), ordered = TRUE)
+   )
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(functional = factor(
+      functional, 
+      levels = c("Sal", "Sev", "Maj2", "Maj1", "Mod", "Min2", "Min1", "Typ"),
+      ordered = TRUE
+   ))
+
+```
+
+```{r}
+
+ames <- ames %>% 
+   mutate(garage_finish = factor(
+      garage_finish,
+      levels = c("none", "Unf", "RFn", "Fin"),
+      ordered = TRUE
+   ))
+
+```
+
+## Continuous variables
+
+We can now turn our attention to the numeric values proper. In this dataset, the numeric features can be split into two types: (1) those which represent continuous features;  and (2) those which represent discrete features. The chief problem here, for both types of numeric feature, is the presence of too many zero values. 
+
+Our goal is to address the problem of zero-inflation, so our analysis can be confined to continuous features. Discrete or count variables don't suffer from zero-inflation but rather from zero (or near-zero) variance. This is a problem we can address at the recipe stage.
+
+```{r}
+
+continuous_variables <- 
+   c("lot_area", "mas_vnr_area", "bsmt_fin_sf_1", "bsmt_fin_sf_2", "bsmt_unf_sf", 
+     "total_bsmt_sf", "x1st_flr_sf", "x2nd_flr_sf", "low_qual_fin_sf", "gr_liv_area",
+      "garage_area", "wood_deck_sf", "open_porch_sf", "enclosed_porch", "x3ssn_porch",
+      "screen_porch", "pool_area", "misc_val", "house_age")
+
+```
+
+Let's examine the above variables:
+
+```{r}
+
+ames %>% 
+   select(all_of(continuous_variables)) %>% 
+   map_dfr(function(.x) tibble(zero_count = sum(.x == 0),
+                              percent_zero = round(zero_count / length(.x), 3)),
+          .id = "variable") %>% 
+   filter(zero_count > 0) %>% 
+   arrange(desc(zero_count))
+
+remove(continuous_variables)
+
+```
+
+Any features that have a very high degree of zero values should be deleted, unless the variable in question can be combined with one of more other features to reduce the number of zeros to an acceptable level.
+
+For example, we can combine any outside living areas as follows:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(porch_x_deck = x3ssn_porch + screen_porch + enclosed_porch + 
+             wood_deck_sf + open_porch_sf) %>% 
+   select(-x3ssn_porch, -screen_porch, -enclosed_porch, -wood_deck_sf, -open_porch_sf)
+
+```
+
+Next we can combine bathrooms:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(total_bathrooms = full_bath + bsmt_full_bath + (half_bath * 0.5) 
+          + (bsmt_half_bath * 0.5)) %>% 
+   select(-full_bath, -bsmt_full_bath, -half_bath, -bsmt_half_bath)
+
+```
+
+Next we can create a variable for total square foot above ground (this replaces `gr_liv_area` with a more accurate figure):
+
+```{r}
+
+ames <- ames %>% 
+   mutate(sqft_above_ground = x1st_flr_sf + x2nd_flr_sf) %>% 
+   select(-x1st_flr_sf, -x2nd_flr_sf, -gr_liv_area)
+
+```
+
+As we already have a value for `total_bsmt_sf`, we can eliminate any further basement variables:
+
+```{r}
+
+ames <- ames %>% 
+   select(-bsmt_fin_sf_1, -bsmt_fin_sf_2, -bsmt_unf_sf)
+
+```
+
+Any remaining values with more than 50% of the values == zero can be dropped. Once again, we shall do this by code rather than by eye:
+
+```{r}
+
+excess_zeros <-ames %>% 
+   summarise(across(everything(), function(.x) mean(.x == 0, na.rm = TRUE))) %>% 
+   select_if(function(.x) .x > 0.5) %>% 
+   names()
+
+ames <- ames %>% 
+   select(-all_of(excess_zeros))
+
+remove(excess_zeros)
+
+```
+
+We are now left with the following continuous variables:
+
+```{r}
+
+continuous_variables <- c("lot_area", "total_bsmt_sf", "garage_area", "house_age",
+                          "porch_x_deck", "sqft_above_ground")
+
+```
+
+## Possible Outliers
+
+Now we can now look at outliers. The standard method of calculating outliers is to define any value as an outlier if it meets either of the following conditions: (1) it is less than Q1 - 1.5 * IQR; or (2) it is more than Q3 + 1.5 * IQR. 
+
+Let's construct a table showing all outliers before investigating in closer detail:
+
+```{r}
+
+ames %>% 
+   select(all_of(continuous_variables)) %>% 
+   map_dfr(function(.x) tibble(zero_count = sum(.x == 0),
+                               min = min(.x),
+                               first = quantile(.x, 0.25),
+                               median = median(.x),
+                               third = quantile(.x, 0.75),
+                               max = max(.x),
+                               low_outliers = sum(.x < (first - (1.5 * third - first))),
+                               high_outliers = sum(.x > (third + (1.5 * (third - first))))),
+           .id = "variable") %>% 
+   select(variable, low_outliers, high_outliers, min, median, max) %>% 
+   arrange(desc(high_outliers)) 
+
+```
+
+It is interesting that we have a house that was sold before it was actually built. As this is perfectly possible, and as all the other values of this variable seem reasonable, we shall not perform any additional feature engineering on this feature.
+
+With the exception of `house_age`, all of the `max()` values in the above table seem very suspect. 
+
+Let's create an upper bound for the value of `lot_area`:
+
+```{r}
+
+lot_upper <- ames %>% 
+   summarise(
+      upper_bound_lot = quantile(lot_area, 0.75) + 1.5 * IQR(lot_area)
+   ) %>% 
+   as.double()
+
+lot_upper
+
+```
+
+We now substitute `lot_upper` for any outliers in `lot_area`:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(lot_area = if_else(
+      lot_area > lot_upper,
+      lot_upper,
+      lot_area
+   ))
+
+```
+
+We repeat this process for all other outliers:
+
+```{r}
+
+sqft_upper <- ames %>% 
+   summarise(
+      sqft_upper = quantile(sqft_above_ground, 0.75) + 1.5 * IQR(sqft_above_ground)
+   ) %>% 
+   as.double()
+
+porch_upper <- ames %>% 
+   summarise(
+      porch_upper = quantile(porch_x_deck, 0.75) + 1.5 * IQR(porch_x_deck)
+   ) %>% 
+   as.double()
+
+bsmt_upper <- ames %>% 
+   summarise(
+      bsmt_upper = quantile(total_bsmt_sf, 0.75) + 1.5 * IQR(total_bsmt_sf)
+   ) %>% 
+   as.double()
+
+garage_upper <- ames %>% 
+   summarise(
+      garage_upper = quantile(garage_area, 0.75) + 1.5 * IQR(garage_area)
+   ) %>% 
+   as.double()
+
+```
+
+We then trim these values in our dataframe:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(sqft_above_ground = if_else(
+      sqft_above_ground > sqft_upper,
+      sqft_upper,
+      sqft_above_ground
+   ))
+
+ames <- ames %>% 
+   mutate(porch_x_deck = if_else(
+      porch_x_deck > porch_upper,
+      porch_upper,
+      porch_x_deck
+   ))
+
+ames <- ames %>% 
+   mutate(total_bsmt_sf = if_else(
+      total_bsmt_sf > bsmt_upper,
+      bsmt_upper,
+      total_bsmt_sf
+   ))
+
+ames <- ames %>% 
+   mutate(garage_area = if_else(
+      garage_area > garage_upper,
+      garage_upper,
+      garage_area
+   ))
+
+```
+
+Finally we can remove any values we no longer need:
+
+```{r}
+
+remove(lot_upper, sqft_upper, porch_upper, bsmt_upper, garage_upper)
+
+```
+
+## Distributions
+
+Please see my [ShinyApp](https://www.shinyapps.io/admin/#/application/6719839) to see the distributions plotted as histograms for all transformations.
+
+When building a linear model we want all of our variables to be normally distributed. Let's first look at our response variable `sale_price`:
+
+```{r}
+
+ames %>% 
+   ggplot(aes(x = sale_price)) +
+   geom_histogram(colour = "black", bins = 30, fill = "#b0afa0") + 
+   labs(x = NULL, y = NULL, title = "Distribution of sale price") +
+   scale_x_continuous(labels = label_dollar()) +
+   theme(
+      axis.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 16)
+   )
+
+```
+
+We can easily log-transform this value:
+
+```{r}
+
+ames %>% 
+   ggplot(aes(x = log(sale_price))) +
+   geom_histogram(colour = "black", bins = 30, fill = "#b0afa0") + 
+   labs(x = NULL, y = NULL, title = "Log transform of sale price") +
+   theme(
+      axis.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 16)
+   )
+
+```
+
+It's not obvious that this is much of an improvement, so let's use `map_dfr()` to create a table showing the levels of skew for each value. We can use the `bestNormalize` package to see which transformation is best. 
+
+```{r}
+
+ames %>% 
+   select(all_of(continuous_variables), lot_frontage, sale_price) %>% 
+   map_dfr(function(.x) tibble(
+      skew_base = round(skewness(.x, na.rm = TRUE), 3),
+      skew_log = round(skewness(log(.x), na.rm = TRUE), 3),
+      skew_sqrt = round(skewness(sqrt(.x), na.rm = TRUE), 3),
+      skew_yeo = round(skewness(predict(yeojohnson(.x)), na.rm = TRUE), 3), 
+      skew_bn = round(skewness(predict(bestNormalize(.x)), na.rm = TRUE), 3)
+   ), 
+      .id = "variable") %>% 
+   mutate(across(where(is.numeric), abs))
+
+```
+
+A couple of things need to be said here. Overall the `bestNormalize()` function returns the best values; but we cannot use this for the response variable `sale_price` because we need to convert the transformed variable back to its original scale to assess our model. 
+
+Although there is, in theory, a `step_best_normalize()` function available at the `recipe` stage, there seems to be a bug in that function that throws an error. Therefore we shall transform the variables we need here instead:
+
+```{r}
+
+ames <- ames %>% 
+   mutate(across(
+      all_of(continuous_variables), 
+      function(.x) predict(bestNormalize(.x))
+   ))
+
+```
+
+We shall transform `lot_frontage` and `sale_price` in our `recipe`, using `step_sqrt()` and `step_log()` respectively, as per the table above. 
+
+(We can't transform `lot_frontage` using `bestNormalize()` as we don't impute the missing values of `lot_frontage` until the `recipe()` stage and, as noted above, `step_best_normalize()` seems not to work.)
+
+# Building our Model
+
+We can now begin to model our data. Although there several steps to work through, the `tidymodels` collection of packages makes the task fairly simple.
+
+First we need to re-split our data into training and test sets. We shall also need cross-validation sets in order to tune our model, which we make from the training data. 
+
+We then construct a `recipe` to handle the preprocessing. We also construct a model specification which states the algorithm and the engine we intend to use. We combine the recipe and model specification into a `workflow` object and then `tune()` our hyper-parameters, in this case `mixture` and `penalty`.  
+
+When the best values of hyper-parameters are found, we can finalise our workflow and fit the model to the training data. Finally we `predict()` on the test data and evaluate our model. 
+
+## Preprocessing our data
+
+First we need to split into training and test data.
+
+```{r}
+
+ames_train <- ames %>% 
+   filter(!is.na(sale_price))
+
+ames_test <- ames %>% 
+   filter(is.na(sale_price))
+
+```
+
+We can now set a seed and make our cross-validation folds for training:
+
+```{r}
+
+set.seed(123)
+
+```
+
+```{r}
+
+ames_k_folds <- vfold_cv(ames_train, v = 10)
+
+```
+
+In the `tidymodels` ecosystem, the preprocessing is done via a `recipe`, which is a series of steps that transforms our data before passing it to the model engine.
+
+```{r}
+
+ames_recipe <- 
+   ames_train %>% 
+   recipe(sale_price ~ .) %>% 
+   step_rm(order, pid) %>% 
+   step_log(sale_price, skip = TRUE) %>% 
+   step_lencode_mixed(all_of(!!high_dims), outcome = vars(sale_price)) %>%
+   step_ordinalscore(all_of(!!ordinal_factors)) %>% 
+   step_other(all_of(!!nominal_factors), threshold = 0.05) %>% 
+   step_dummy(all_of(!!nominal_factors), one_hot = TRUE) %>% 
+   step_impute_knn(lot_frontage) %>% 
+   step_sqrt(lot_frontage) %>% 
+   step_nzv(all_predictors()) %>% 
+   step_corr(all_predictors()) %>% 
+   step_normalize(all_numeric_predictors())
+
+```
+
+We shall use linear regression to predict the outcomes. More specifically we shall use an elastic net model where the values for `penalty` and `mixture` are found via extensive tuning. 
+
+```{r}
+
+elastic_spec <- linear_reg(
+   penalty = tune(), mixture = tune()) %>% 
+   set_mode("regression") %>% 
+   set_engine("glmnet")
+
+```
+
+We wrap our `recipe` and `model_spec` into a `workflow`. This isn't necessary but it make the process much simpler. 
+
+```{r}
+
+ames_workflow <- workflow() %>% 
+   add_model(elastic_spec) %>% 
+   add_recipe(ames_recipe)
+
+```
+
+## Tuning Hyper-parameters
+
+Tuning a model can be very time consuming, so we utilise as many cores as possible.
+
+```{r}
+
+doParallel::registerDoParallel()
+
+```
+
+We now set a seed so our results are easily reproduced:
+
+```{r}
+
+set.seed(2022)
+
+```
+
+Finally we tune the hyper-parameters of our model:
+
+```{r}
+
+elastic_net_tune <- tune_grid(
+   ames_workflow,
+   resamples = ames_k_folds,
+   grid = 30
+)
+
+```
+
+We can use the `select_best` function to find the best combination of hyper-parameters: 
+
+```{r}
+
+elastic_net_rmse <-  elastic_net_tune %>% 
+   select_best("rmse")
+
+```
+
+The last thing to do before fitting our model is to update our workflow with the `elastic_net_rmse` above. We do this using the `finalize_workflow()` function:
+
+```{r}
+
+final_workflow <- 
+   finalize_workflow(ames_workflow, elastic_net_rmse)
+
+```
+
+## Fitting our model
+
+Finally we can fit our model.
+
+```{r}
+
+ames_model <- final_workflow %>% 
+   fit(data = ames_train)
+
+```
+
+The `vip` package allows us a very simple way of visualising the most important features.
+
+```{r}
+
+ames_model %>% 
+   extract_fit_engine() %>% 
+   vi() %>% 
+   arrange(-Importance) %>% 
+   mutate(Variable = fct_reorder(Variable, Importance)) %>% 
+   head(12) %>% 
+   ggplot(aes(x = Variable, y = Importance)) + 
+   geom_col(colour = "black", fill = "#b0afa0") + 
+   labs(x = NULL, y = NULL, title = "Variable importance") +
+   theme(
+      axis.text = element_text(face = "bold"),
+      plot.title = element_text(face = "bold", size = 16)
+   ) + 
+   coord_flip()
+
+```
+
+There are no real surprises here. As we would expect, the neighbourhood, the size of the house, and the quality and condition of the house are the most important predictors. Now we have to ask how well our model does on unseen data. 
+
+## Evaluating our model 
+
+The test of any model is how well it performs on unseen data. So let's `predict()` on our test data an see how the results hold up.
+
+```{r}
+
+ames_preds <- ames_model %>% 
+   predict(new_data = ames_test)
+
+```
+
+The competition on Kaggle is [evaluated](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/overview/evaluation) using the RMSE between the predicted value and the log of the sale price
+
+Therefore we bind our predictions with the `sale_price` dataframe, converting the `sale_price` variable to the logarithmic scale. We then use the `rmse()` function form `yardstick` to give us our result. 
+
+```{r}
+
+ames_preds <- ames_preds %>% 
+   bind_cols(sale_price) %>% 
+   mutate(sale_price = log(sale_price))
+
+ames_preds %>% rmse(.pred, sale_price)
+
+```
+
+The [Kaggle leaderboard](https://www.kaggle.com/competitions/house-prices-advanced-regression-techniques/leaderboard) suggests that anything less than 0.13 is a very respectable performance.
+
+Nevertheless, there's little doubt our result could be improved upon. For example, in our `recipe()` we could use `step_poly()` or `step_ns()` on selected predictors to capture any non-linearity. We could also investigate any possible interactions between terms using `step_interact()`. Another obvious step would be to use the `stacks` package and combine different algorithms. 
+
+But all of this can be left for another day.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
